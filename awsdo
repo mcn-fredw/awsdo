@@ -1,0 +1,496 @@
+#!/usr/bin/env python3
+###
+# sodo like module for aws commands
+# example: awsdo --profile sso s3api list-buckets
+#
+# prerequisites:
+# python 2.7 or higher
+# setup tools for pip
+# pip install bs4
+# pip install requests
+# depending on distro, may need to use pip to install other dependencies.
+#
+
+import sys
+import os
+import logging
+import datetime
+import base64
+import getpass
+import re
+import json
+from os.path import expanduser
+import requests
+try:
+    import ConfigParser
+except:
+    import configparser as ConfigParser
+import xml.etree.ElementTree
+from bs4 import BeautifulSoup
+
+# Uncomment to enable low level debugging
+#logging.basicConfig(level=logging.DEBUG)
+
+##
+# Class AwsDoSSO
+# sudo for AWS CLI commands where credentials are obtained using JC SAML SSO.
+#
+class AwsDoSSO(object):
+    ## Default AWS region.
+    REGION = 'us-west-2'
+    # AWS CLI default output format.
+    OUTPUT_FORMAT = 'json'
+    ## AWS credentials file path relative to home directory.
+    AWS_CONFIG = '/.aws/credentials'
+    ## Flags whether to verify SSL certificates.
+    VERIFY_SSL = True
+    # URL to get cross site request forgery token.
+    XSRF_URL = 'https://console.jumpcloud.com/userconsole/xsrf'
+    # URL to submit SSO credentials to.
+    SSO_AUTH_URL = 'https://console.jumpcloud.com/userconsole/auth'
+    ## SAML AWS role attribute name.
+    AWS_ROLE_ATTRIBUTE = 'https://aws.amazon.com/SAML/Attributes/Role'
+    ## Selector for SAML attribute elements.
+    ATTRIBUTES = '{urn:oasis:names:tc:SAML:2.0:assertion}Attribute'
+    ## Selector for SAML attribute value elements.
+    ATTRIBUTE_VALUES = '{urn:oasis:names:tc:SAML:2.0:assertion}AttributeValue'
+    ## command line arguments
+    cmdArgs = ['aws']
+    ## credentials profile
+    profile = 'default'
+    ## Success message.
+    SUCCESS = '''
+----------------------------------------------------------------
+Your new access key pair has been stored under the "%s" profile
+in the AWS configuration file %s.
+Note that it will expire at %s.
+After that time, rerun this script to refresh your access key pair.
+To use this credential, call the AWS CLI with the --profile "%s" option.
+----------------------------------------------------------------
+'''
+
+    ##
+    # Perform an aws cli command.
+    #
+    def doCommand(self):
+        _n = 0
+        for _a in sys.argv[1:]:
+            if _n > 1:
+                _n += 1
+            if _n == 1:
+                self.profile = _a
+                _n = 2
+            if '--profile' == _a:
+                _n = 1
+            if _a.startswith('--profile='):
+                self.profile = _a[10:]
+                _n = 2
+            self.cmdArgs.append(_a)
+        if self.needLogin():
+            self._session = requests.Session()
+            self.saveTemporaryCredentials(self.authenticate())
+        if _n < 3:
+            # no aws commands to execute, just authenticate.
+            return
+        return os.system(' '.join(self.cmdArgs))
+
+    ##
+    # Test credentials expired.
+    # @return True if sso login is required, False otherwise
+    # @pre User may set username and password in [awsdo] section
+    # of ~/.aws/credentials file.
+    #
+    def needLogin(self):
+        try:
+            if not self.samlExpiration:
+                return True
+        except:
+            return True
+        now = None
+        try:
+            now = datetime.datetime.utcnow().isoformat('T')
+        except:
+            now = datetime.datetime.utcnow().isoformat(b'T')
+        now = now.split('.')[0] + 'Z'
+        return bool(now > self.samlExpiration)
+
+    ##
+    # Perform jump cloud authentication
+    #
+    def authenticate(self):
+        r = self._session.post(
+            self.SSO_AUTH_URL,
+            headers=self.jumpCloudAuthHeaders,
+            data=self.jumpCloudAuthPayload
+        )
+        _json = r.json()
+        if 'redirectTo' not in _json:
+            r = self._session.post(
+                self.SSO_AUTH_URL,
+                headers=self.jumpCloudAuthHeaders,
+                data=self.jumpCloudMFAPayload
+            )
+            _json = r.json()
+        if 'redirectTo' not in _json:
+            print(_json)
+            print('Authentication failed')
+            sys.exit(1)
+        return self._session.get(
+            _json['redirectTo'],
+            headers={'X-Xsrftoken': self.xsrfToken}
+        )
+
+    ##
+    # Saves aws temporary credentials.
+    # @param response Response object from authenticate().
+    # @post aws temporary credentials written to
+    # self.profile sectiion of aws config.
+    #
+    def saveTemporaryCredentials(self, response):
+        self.rawAssertion = response
+        if not self.awsConfig.has_section(self.profile):
+            self.awsConfig.add_section(self.profile)
+        self.samlOutputFormat = self.OUTPUT_FORMAT
+        self.samlRegion = self.REGION
+        self.samlKeyId = self.token.credentials.access_key
+        self.samlKey = self.token.credentials.secret_key
+        self.samlSession = self.token.credentials.session_token
+        self.samlExpiration = self.token.credentials.expiration
+        with open(self.awsConfigPath, 'w+') as configfile:
+            self.awsConfig.write(configfile)
+        print(self.SUCCESS % (self.profile, self.awsConfigPath, self.samlExpiration, self.profile))
+
+    ##
+    # Allow user to pick aws role.
+    # @param awsRoles list of aws roles.
+    # @return aws role element.
+    #
+    def pickRole(self, awsRoles):
+        print("")
+        i = 0
+        print("Please choose the role you would like to assume:")
+        for awsrole in awsRoles:
+            print( '[', i, ']: ', awsrole.split(',')[0])
+            i += 1
+        selectedroleindex = input("Selection: ")
+        if int(selectedroleindex) > (len(awsRoles) - 1):
+            print('You selected an invalid role index, please try again')
+            sys.exit(1)
+        return awsRoles[int(selectedroleindex)]
+
+    ##
+    # Gets JumpCloud authentication headers.
+    # @return dict request headers.
+    #
+    @property
+    def jumpCloudAuthHeaders(self):
+        return {
+            'X-Xsrftoken': self.xsrfToken,
+            'Accept': 'application/json',
+            'Content-Type': 'application/json'
+        }
+
+    ##
+    # Gets JumpCloud authentication payload.
+    # @return string JSON encoded request payload.
+    #
+    @property
+    def jumpCloudAuthPayload(self):
+        return json.dumps({
+            'context': 'sso',
+            'redirectTo': self.awsAccount,
+            'email': self.username,
+            'password': self.password
+        })
+
+
+    ##
+    # Gets JumpCloud MFA authentication payload.
+    # @return string JSON encoded request payload.
+    #
+    @property
+    def jumpCloudMFAPayload(self):
+        return json.dumps({
+            'context': 'sso',
+            'redirectTo': self.awsAccount,
+            'email': self.username,
+            'password': self.password,
+            'otp': self.otp
+        })
+    
+    ##
+    # Gets aws account to login to.
+    # @return string
+    @property
+    def awsAccount(self):
+        try:
+            return self.awsConfig.get(self.profile, 'account')
+        except:
+            pass
+        return 'saml2/aws'
+
+    ##
+    # Gets path for user's aws config file.
+    # @return string aws config file path.
+    #
+    @property
+    def awsConfigPath(self):
+        home = expanduser("~")
+        return home + self.AWS_CONFIG
+
+    ##
+    # gets aws config file as an object.
+    # @return config Parsed aws config file.
+    #
+    @property
+    def awsConfig(self):
+        try:
+            _x = self._config
+        except:
+            self._config = ConfigParser.RawConfigParser()
+            self._config.read(self.awsConfigPath)
+        return self._config
+
+    ##
+    # Gets aws output format.
+    # @return string aws output format.
+    #
+    @property
+    def samlOutputFormat(self):
+        return self.awsConfig.get(self.profile, 'output')
+
+    ##
+    # Sets aws output format.
+    # @param formatType String format type.
+    #
+    @samlOutputFormat.setter
+    def samlOutputFormat(self, formatType):
+        self.awsConfig.set(self.profile, 'output', formatType)
+
+    ##
+    # Gets aws region.
+    # @return string aws region name.
+    #
+    @property
+    def samlRegion(self):
+        return self.awsConfig.get(self.profile, 'region')
+
+    ##
+    # Sets aws region.
+    # @param region String aws region name.
+    #
+    @samlRegion.setter
+    def samlRegion(self, region):
+        self.awsConfig.set(self.profile, 'region', region)
+
+    ##
+    # Gets aws key id.
+    # @return string aws key id.
+    #
+    @property
+    def samlKeyId(self):
+        return self.awsConfig.get(self.profile, 'aws_access_key_id')
+
+    ##
+    # Sets aws key id.
+    # @param keyId String aws key id.
+    #
+    @samlKeyId.setter
+    def samlKeyId(self, keyId):
+        self.awsConfig.set(self.profile, 'aws_access_key_id', keyId)
+
+    ##
+    # Gets aws key.
+    # @return string aws key.
+    #
+    @property
+    def samlKey(self):
+        return self.awsConfig.get(self.profile, 'aws_secret_access_key')
+
+    ##
+    # Sets aws key.
+    # @param key String aws key.
+    #
+    @samlKey.setter
+    def samlKey(self, key):
+        self.awsConfig.set(self.profile, 'aws_secret_access_key', key)
+
+    ##
+    # Gets aws session.
+    # @return string aws session.
+    #
+    @property
+    def samlSession(self):
+        return self.awsConfig.get(self.profile, 'aws_session_token')
+
+    ##
+    # Sets aws expiration.
+    # @param session String aws expiration.
+    #
+    @samlSession.setter
+    def samlSession(self, session):
+        self.awsConfig.set(self.profile, 'aws_session_token', session)
+
+    ##
+    # Gets aws expiration.
+    # @return string aws expiration.
+    #
+    @property
+    def samlExpiration(self):
+        return self.awsConfig.get(self.profile, 'expiration')
+
+    ##
+    # Sets aws expiration.
+    # @param expiration String aws expiration
+    #
+    @samlExpiration.setter
+    def samlExpiration(self, expiration):
+        self.awsConfig.set(self.profile, 'expiration', expiration)
+
+    ##
+    # Gets decoded SAML assertion.
+    # @return xml.etree.ElementTree of decoded SAML assertion.
+    #
+    @property
+    def assertion(self):
+        try:
+            _x = self._assertion
+        except:
+            self._assertion = xml.etree.ElementTree.fromstring(
+                base64.b64decode(self._rawAssertion)
+            )
+        return self._assertion
+
+    ##
+    # Gets  SAML assertion.
+    # @return string base64 encoded SAML assertion.
+    #
+    @property
+    def rawAssertion(self):
+        return self._rawAssertion
+
+    ##
+    # Sets raw and decoded SAML assertion.
+    # @param response Response object from
+    # https://sso.jumpcloud.com/saml2/aws
+    #
+    @rawAssertion.setter
+    def rawAssertion(self, response):
+        page = ''
+        try:
+            page = BeautifulSoup(response.text.decode('utf8'), 'html.parser')
+        except:
+            page = BeautifulSoup(response.text, 'html.parser')
+        for element in page.find_all('input'):
+            if element.get('name') == 'SAMLResponse':
+                self._rawAssertion = element.get('value')
+                return
+        print('Response did not contain a valid SAML assertion')
+        print(page)
+        sys.exit(1)
+
+    ##
+    # Gets aws credential token.
+    # @return aws token.
+    #
+    @property
+    def token(self):
+        try:
+            _x = self._token
+        except:
+            parts = self.role.split(',')
+            conn = boto.sts.connect_to_region(self.REGION)
+            self._token = conn.assume_role_with_saml(
+                parts[0],
+                parts[1],
+                self.rawAssertion
+            )
+        return self._token
+
+    ##
+    # Gets aws role.
+    # @return string aws role.
+    #
+    @property
+    def role(self):
+        try:
+            _x = self._role
+        except:
+            awsroles = []
+            for attr in self.assertion.iter(self.ATTRIBUTES):
+                if attr.get('Name') == self.AWS_ROLE_ATTRIBUTE:
+                    for value in attr.iter(self.ATTRIBUTE_VALUES):
+                        chunks = value.text.split(',')
+                        if'saml-provider' in chunks[0]:
+                            awsroles.append(chunks[1] + ',' + chunks[0])
+                        else:
+                            awsroles.append(value.text)
+            if not awsroles:
+                print('No AWS roles found in SAML assertion.')
+                sys.exit(1)
+            if  1 == len(awsroles):
+                self._role = awsroles[0]
+            else:
+                self._role = self.pickRole(awsroles)
+        return self._role
+
+    ##
+    # gets user password.
+    # @return string User password for authentication.
+    #
+    @property
+    def otp(self):
+        try:
+            _x = self._otp
+        except:
+            self._otp = input("MFA code: ")
+        return self._otp
+
+    ##
+    # gets user password.
+    # @return string User password for authentication.
+    #
+    @property
+    def password(self):
+        try:
+            _x = self._password
+        except:
+            try:
+                self._password = self.awsConfig.get(self.profile, 'password')
+            except:
+                self._password = getpass.getpass()
+        return self._password
+
+    ##
+    # gets username.
+    # @return string User name for authentication.
+    #
+    @property
+    def username(self):
+        try:
+            _x = self._username
+        except:
+            try:
+                self._username = self.awsConfig.get(self.profile, 'username')
+            except Exception as e:
+                logging.exception(e)
+                self._username = input("Email: ")
+        return self._username
+
+    ##
+    # gets xsrf token.
+    # @return string XSRF token
+    #
+    @property
+    def xsrfToken(self):
+        try:
+            _x = self._xsrfToken
+        except:
+            r = self._session.get(self.XSRF_URL, verify=self.VERIFY_SSL)
+            self._xsrfToken = r.json()['xsrf']
+        return self._xsrfToken
+
+# Run as main
+if __name__ == '__main__':
+    _aws = AwsDoSSO()
+    _aws.doCommand()
