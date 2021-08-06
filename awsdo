@@ -4,11 +4,12 @@
 # example: awsdo --profile sso s3api list-buckets
 #
 # prerequisites:
-# python 2.7 or higher
+# python 3+ or higher
 # setup tools for pip
 # pip install bs4
 # pip install requests
 # depending on distro, may need to use pip to install other dependencies.
+# assumes awscli is installed
 #
 
 import sys
@@ -19,6 +20,7 @@ import base64
 import getpass
 import re
 import json
+import boto3
 from os.path import expanduser
 import requests
 try:
@@ -107,11 +109,7 @@ To use this credential, call the AWS CLI with the --profile "%s" option.
         except:
             return True
         now = None
-        try:
-            now = datetime.datetime.utcnow().isoformat('T')
-        except:
-            now = datetime.datetime.utcnow().isoformat(b'T')
-        now = now.split('.')[0] + 'Z'
+        now = datetime.datetime.utcnow().isoformat('T')
         return bool(now > self.samlExpiration)
 
     ##
@@ -152,10 +150,10 @@ To use this credential, call the AWS CLI with the --profile "%s" option.
             self.awsConfig.add_section(self.profile)
         self.samlOutputFormat = self.OUTPUT_FORMAT
         self.samlRegion = self.REGION
-        self.samlKeyId = self.token.credentials.access_key
-        self.samlKey = self.token.credentials.secret_key
-        self.samlSession = self.token.credentials.session_token
-        self.samlExpiration = self.token.credentials.expiration
+        self.samlKeyId = self.token['Credentials']['AccessKeyId']
+        self.samlKey = self.token['Credentials']['SecretAccessKey']
+        self.samlSession = self.token['Credentials']['SessionToken']
+        self.samlExpiration = self.token['Credentials']['Expiration'].isoformat('T')
         with open(self.awsConfigPath, 'w+') as configfile:
             self.awsConfig.write(configfile)
         print(self.SUCCESS % (self.profile, self.awsConfigPath, self.samlExpiration, self.profile))
@@ -399,11 +397,11 @@ To use this credential, call the AWS CLI with the --profile "%s" option.
             _x = self._token
         except:
             parts = self.role.split(',')
-            conn = boto.sts.connect_to_region(self.REGION)
+            conn = boto3.client('sts')
             self._token = conn.assume_role_with_saml(
-                parts[0],
-                parts[1],
-                self.rawAssertion
+                RoleArn=parts[0],
+                PrincipalArn=parts[1],
+                SAMLAssertion=self.rawAssertion
             )
         return self._token
 
